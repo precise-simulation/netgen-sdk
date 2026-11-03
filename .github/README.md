@@ -118,11 +118,15 @@ downloads the complete eight-archive inventory. Its combined verification runs
 for both manual dispatches and release tags. `scripts/verify-netgen-sdk-release.py`
 requires matching schema-v2 producer identity, upstream identity, ordered patch
 hashes, OCCT identity, linkage, and checksum sidecars across the same bytes that
-would be published.
+would be published. The same job independently reconstructs the pinned patched
+Netgen source, creates a deterministic source archive with embedded
+`source-provenance.json`, and requires that archive plus its checksum to match the
+fresh reconstruction exactly.
 
 A normal `workflow_dispatch` with `publish_release=false` is the non-publishing
 combined qualification path. It must finish after all eight archives pass the
-shared verifier and must not create a tag or release.
+shared verifier, including the reconstructed source bundle, and must not create a
+tag or release.
 
 Publishing uses an immutable tag of the form:
 
@@ -134,6 +138,13 @@ SDK archive filenames intentionally retain the established
 `netgen-featool-v<version>-...` prefix so existing consumers and release tooling do
 not need a package-name migration. Repository provenance inside each archive records
 `precise-simulation/netgen-sdk` and the exact standalone producer commit.
+
+The published release contains 18 explicit files: eight SDK archives, eight SDK
+checksum sidecars, the deterministic patched-source archive
+`netgen-<version>-patched-source-<upstream-sha12>.tar.gz`, and its checksum. The
+source archive embeds `source-provenance.json` with the canonical upstream identity
+and ordered patch hashes. GitHub's generated source archives refer to the producer
+tag and are not substitutes for this reconstructed upstream-plus-patches source.
 
 For an eligible tag run, release creation/upload occurs only after the same
 downloaded archive set has passed the combined verifier. A failed or superseded

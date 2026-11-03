@@ -225,10 +225,14 @@ an ordered repository-owned patch set before each build.
 - `scripts/prepare-netgen-source.py`: validates the manifest and LF patch bytes,
   shallow-fetches the exact upstream tag, verifies its commit, applies the ordered
   patch set, checks the result, and writes source provenance.
+- `scripts/package-netgen-source.py`: creates the deterministic reconstructed
+  patched-source release archive with embedded source provenance and adjacent
+  checksum.
 - `scripts/netgen_source.py`: shared manifest, patch, version, and provenance logic.
 - `scripts/check-release-qualification.py`: exact-SHA workflow qualification and
   GitHub compare-API branch-containment decision.
-- `scripts/verify-netgen-sdk-release.py`: combined eight-archive release verifier.
+- `scripts/verify-netgen-sdk-release.py`: combined release verifier for the eight
+  SDK archives/checksums plus the reconstructed patched-source archive/checksum.
 - `tests/windows-native-sdk/` and `tests/unix-native-sdk/`: repository-owned
   external SDK consumer fixtures. These are not copied into reconstructed source.
 - `.github/`: platform producer, OCCT update, combined qualification, and release
@@ -253,6 +257,9 @@ are not part of this repository's active source ownership.
   workflows, producer scripts, or release logic.
 - Patch hashes are release provenance. Preserve canonical LF bytes in
   `patches/netgen/*.patch` and `patches/netgen/series`.
+- Published SDK releases also preserve the exact reconstructed patched source as a
+  deterministic archive with embedded `source-provenance.json`; keep that archive
+  and checksum inside the combined release-verification contract.
 - Catch regressions that must run inside Netgen belong in the patch set. External
   SDK consumer fixtures belong in this repository's retained native test folders.
 - Keep OCCT release identity in `.github/occt-sdk-release.txt` and platform producer

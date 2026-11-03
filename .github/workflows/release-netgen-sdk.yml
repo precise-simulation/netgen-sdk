@@ -88,6 +88,18 @@ jobs:
           path: ${{ runner.temp }}/release-assets/macos
           merge-multiple: true
 
+      - name: Reconstruct and package patched Netgen source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/prepare-netgen-source.py \
+            --destination "$RUNNER_TEMP/reconstructed-netgen-source" \
+            --provenance "$RUNNER_TEMP/source-provenance.json"
+          python3 scripts/package-netgen-source.py \
+            --source-root "$RUNNER_TEMP/reconstructed-netgen-source" \
+            --provenance "$RUNNER_TEMP/source-provenance.json" \
+            --output-dir "$RUNNER_TEMP/source-assets"
+
       - name: Verify exact release asset inventory and provenance
         shell: bash
         env:
@@ -97,6 +109,8 @@ jobs:
           occt_release="$(tr -d '\r\n' < .github/occt-sdk-release.txt)"
           python3 scripts/verify-netgen-sdk-release.py \
             --assets-root "$RUNNER_TEMP/release-assets" \
+            --source-assets-root "$RUNNER_TEMP/source-assets" \
+            --source-root "$RUNNER_TEMP/reconstructed-netgen-source" \
             --producer-sha "$GITHUB_SHA" \
             --producer-repository "$GITHUB_REPOSITORY" \
             --occt-release "$occt_release" \
@@ -106,6 +120,7 @@ jobs:
           echo "NETGEN_TAG=$(jq -r .netgen_tag "$RUNNER_TEMP/release-summary.json")" >> "$GITHUB_ENV"
           echo "NETGEN_VERSION=$(jq -r .netgen_version "$RUNNER_TEMP/release-summary.json")" >> "$GITHUB_ENV"
           echo "NETGEN_UPSTREAM_SHA=$(jq -r .upstream_commit "$RUNNER_TEMP/release-summary.json")" >> "$GITHUB_ENV"
+          echo "NETGEN_SOURCE_ARCHIVE=$(jq -r .source_archive "$RUNNER_TEMP/release-summary.json")" >> "$GITHUB_ENV"
           echo "OCCT_SOURCE_SHA=$(jq -r .occt_source_sha "$RUNNER_TEMP/release-summary.json")" >> "$GITHUB_ENV"
 
       - name: Verify publication tag
@@ -250,14 +265,22 @@ jobs:
             exit 1
           fi
 
-          mapfile -t assets < <(find "$RUNNER_TEMP/release-assets" -type f -print | sort)
-          test "${#assets[@]}" -eq 16
+          mapfile -t sdk_assets < <(find "$RUNNER_TEMP/release-assets" -type f -print | sort)
+          test "${#sdk_assets[@]}" -eq 16
+          mapfile -t source_assets < <(find "$RUNNER_TEMP/source-assets" -maxdepth 1 -type f -print | sort)
+          test "${#source_assets[@]}" -eq 2
+          assets=("${sdk_assets[@]}" "${source_assets[@]}")
+          test "${#assets[@]}" -eq 18
+          test -f "$RUNNER_TEMP/source-assets/$NETGEN_SOURCE_ARCHIVE"
+          test -f "$RUNNER_TEMP/source-assets/$NETGEN_SOURCE_ARCHIVE.sha256"
+          (cd "$RUNNER_TEMP/source-assets" && sha256sum -c "$NETGEN_SOURCE_ARCHIVE.sha256")
           notes="Netgen native SDK bundle built from producer source $GITHUB_SHA (upstream $NETGEN_TAG / $NETGEN_UPSTREAM_SHA)."
           notes="$notes"$'\n\n'"OCCT input: precise-simulation/OCCT-sdk $OCCT_RELEASE, source $OCCT_SOURCE_SHA. Each producer records and verifies its exact immutable release asset and SHA-256 digest."
           notes="$notes"$'\n\n'"Windows: x64 VS2022 Release /MD, shared and static SDKs."
           notes="$notes"$'\n'"Linux: x86_64 shared and static SDKs, manylinux2014 / glibc 2.17 / GCC 10 baseline."
           notes="$notes"$'\n'"macOS: thin x86_64 and arm64 shared and static SDKs targeting macOS 13.0 with Xcode 16.4."
-          notes="$notes"$'\n\n'"Each archive has a SHA-256 sidecar and was re-extracted and qualified through the native OCC consumer."
+          notes="$notes"$'\n\n'"Each SDK archive has a SHA-256 sidecar and was re-extracted and qualified through the native OCC consumer."
+          notes="$notes"$'\n\n'"Exact reconstructed patched Netgen source: $NETGEN_SOURCE_ARCHIVE (with adjacent SHA-256 checksum and embedded source-provenance.json). GitHub's generated source archives describe the automation tag, not this reconstructed upstream-plus-patches source tree."
           notes="$notes"$'\n\n'"<!-- $run_marker -->"
 
           verify_remote_tag
@@ -275,7 +298,7 @@ jobs:
           test "$(jq -r '.draft' <<<"$release_json")" = true
           test "$(jq -r '.prerelease' <<<"$release_json")" = false
           test "$(jq -r '.tag_name' <<<"$release_json")" = "$GITHUB_REF_NAME"
-          test "$(jq '.assets | length' <<<"$release_json")" -eq 16
+          test "$(jq '.assets | length' <<<"$release_json")" -eq 18
           for file in "${assets[@]}"; do
             name="$(basename "$file")"
             expected="sha256:$(sha256sum "$file" | awk '{print $1}')"
@@ -297,7 +320,7 @@ jobs:
             exit 1
           fi
           test "$(jq -r '.tag_name' <<<"$release_json")" = "$GITHUB_REF_NAME"
-          test "$(jq '.assets | length' <<<"$release_json")" -eq 16
+          test "$(jq '.assets | length' <<<"$release_json")" -eq 18
           for file in "${assets[@]}"; do
             name="$(basename "$file")"
             expected="sha256:$(sha256sum "$file" | awk '{print $1}')"
