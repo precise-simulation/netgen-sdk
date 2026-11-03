@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.cache/
+build/
+dist/
+*.zip
+*.tar.gz
+*.whl

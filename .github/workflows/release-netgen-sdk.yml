@@ -1,0 +1,219 @@
+name: Release Netgen SDK bundle
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Publish the combined release for a netgen-sdk-* tag
+        required: false
+        type: boolean
+        default: false
+  push:
+    tags:
+      - netgen-sdk-*
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  windows:
+    name: Windows SDK
+    permissions:
+      contents: write
+      actions: read
+    uses: ./.github/workflows/windows-netgen-sdk.yml
+    with:
+      bundle_release: ${{ startsWith(github.ref, 'refs/tags/netgen-sdk-') && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_release)) }}
+
+  linux:
+    name: Linux SDK
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/linux-netgen-sdk.yml
+    with:
+      bundle_release: ${{ startsWith(github.ref, 'refs/tags/netgen-sdk-') && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_release)) }}
+
+  macos:
+    name: macOS SDKs
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/macos-netgen-sdk.yml
+    with:
+      bundle_release: ${{ startsWith(github.ref, 'refs/tags/netgen-sdk-') && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_release)) }}
+
+  publish:
+    name: Verify and publish combined Netgen SDK release
+    needs:
+      - windows
+      - linux
+      - macos
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out exact release workflow revision
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Download Windows SDK
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          pattern: windows-netgen-sdk-*
+          path: ${{ runner.temp }}/release-assets/windows
+          merge-multiple: true
+
+      - name: Download Linux SDK
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          pattern: netgen-linux-sdk-*
+          path: ${{ runner.temp }}/release-assets/linux
+          merge-multiple: true
+
+      - name: Download macOS SDKs
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          pattern: netgen-macos-sdk-*
+          path: ${{ runner.temp }}/release-assets/macos
+          merge-multiple: true
+
+      - name: Verify exact release asset inventory and provenance
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          occt_release="$(tr -d '\r\n' < .github/occt-sdk-release.txt)"
+          python3 scripts/verify-netgen-sdk-release.py \
+            --assets-root "$RUNNER_TEMP/release-assets" \
+            --producer-sha "$GITHUB_SHA" \
+            --producer-repository "$GITHUB_REPOSITORY" \
+            --occt-release "$occt_release" \
+            > "$RUNNER_TEMP/release-summary.json"
+
+          echo "OCCT_RELEASE=$occt_release" >> "$GITHUB_ENV"
+          echo "NETGEN_TAG=$(jq -r .netgen_tag "$RUNNER_TEMP/release-summary.json")" >> "$GITHUB_ENV"
+          echo "NETGEN_VERSION=$(jq -r .netgen_version "$RUNNER_TEMP/release-summary.json")" >> "$GITHUB_ENV"
+          echo "NETGEN_UPSTREAM_SHA=$(jq -r .upstream_commit "$RUNNER_TEMP/release-summary.json")" >> "$GITHUB_ENV"
+          echo "OCCT_SOURCE_SHA=$(jq -r .occt_source_sha "$RUNNER_TEMP/release-summary.json")" >> "$GITHUB_ENV"
+
+      - name: Verify publication tag
+        if: startsWith(github.ref, 'refs/tags/netgen-sdk-') && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_release))
+        shell: bash
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA:0:12}"
+          if [[ ! "$GITHUB_REF_NAME" =~ ^netgen-sdk-([0-9a-fA-F]{12})-r([0-9]+)$ ]]; then
+            echo "release tag must match netgen-sdk-<12-char-source-sha>-rN" >&2
+            exit 1
+          fi
+          test "${BASH_REMATCH[1],,}" = "$short_sha"
+      - name: Create, verify and publish combined release
+        if: startsWith(github.ref, 'refs/tags/netgen-sdk-') && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_release))
+        shell: bash
+        run: |
+          set -euo pipefail
+          api_version="2026-03-10"
+          draft_id=""
+
+          find_draft_id() {
+            gh api --paginate \
+              -H "X-GitHub-Api-Version: $api_version" \
+              "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+              jq -rs --arg tag "$GITHUB_REF_NAME" '
+                [ .[][] | select(.tag_name == $tag and .draft == true) ] |
+                if length == 1 then .[0].id
+                elif length == 0 then empty
+                else error("multiple draft releases found for tag")
+                end
+              '
+          }
+
+          verify_remote_tag() {
+            local ref_json object_type object_sha tag_json
+            ref_json="$(gh api \
+              -H "X-GitHub-Api-Version: $api_version" \
+              "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME")"
+            object_type="$(jq -r '.object.type' <<<"$ref_json")"
+            object_sha="$(jq -r '.object.sha' <<<"$ref_json")"
+            for _ in 1 2 3 4 5; do
+              if [[ "$object_type" == commit ]]; then
+                break
+              fi
+              test "$object_type" = tag
+              tag_json="$(gh api \
+                -H "X-GitHub-Api-Version: $api_version" \
+                "repos/$GITHUB_REPOSITORY/git/tags/$object_sha")"
+              object_type="$(jq -r '.object.type' <<<"$tag_json")"
+              object_sha="$(jq -r '.object.sha' <<<"$tag_json")"
+            done
+            test "$object_type" = commit
+            test "$object_sha" = "$GITHUB_SHA"
+          }
+
+          existing_draft_id="$(find_draft_id)"
+          if [[ -n "$existing_draft_id" ]] || gh api \
+            -H "X-GitHub-Api-Version: $api_version" \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "release already exists for $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+
+          mapfile -t assets < <(find "$RUNNER_TEMP/release-assets" -type f -print | sort)
+          test "${#assets[@]}" -eq 16
+          notes="Netgen native SDK bundle built from producer source $GITHUB_SHA (upstream $NETGEN_TAG / $NETGEN_UPSTREAM_SHA)."
+          notes="$notes"$'\n\n'"OCCT input: precise-simulation/OCCT-sdk $OCCT_RELEASE, source $OCCT_SOURCE_SHA. Each producer records and verifies its exact immutable release asset and SHA-256 digest."
+          notes="$notes"$'\n\n'"Windows: x64 VS2022 Release /MD, shared and static SDKs."
+          notes="$notes"$'\n'"Linux: x86_64 shared and static SDKs, manylinux2014 / glibc 2.17 / GCC 10 baseline."
+          notes="$notes"$'\n'"macOS: thin x86_64 and arm64 shared and static SDKs targeting macOS 13.0 with Xcode 16.4."
+          notes="$notes"$'\n\n'"Each archive has a SHA-256 sidecar and was re-extracted and qualified through the native OCC consumer."
+
+          verify_remote_tag
+          gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft \
+            --title "Netgen v$NETGEN_VERSION SDKs - Windows, Linux, macOS" \
+            --notes "$notes"
+
+          draft_id="$(find_draft_id)"
+          test -n "$draft_id"
+          release_json="$(gh api -H "X-GitHub-Api-Version: $api_version" "repos/$GITHUB_REPOSITORY/releases/$draft_id")"
+          test "$(jq -r '.draft' <<<"$release_json")" = true
+          test "$(jq -r '.tag_name' <<<"$release_json")" = "$GITHUB_REF_NAME"
+          test "$(jq '.assets | length' <<<"$release_json")" -eq 16
+          for file in "${assets[@]}"; do
+            name="$(basename "$file")"
+            expected="sha256:$(sha256sum "$file" | awk '{print $1}')"
+            actual="$(jq -r --arg name "$name" '.assets[] | select(.name == $name) | .digest' <<<"$release_json")"
+            test "$actual" = "$expected"
+          done
+
+          verify_remote_tag
+          gh api -X PATCH \
+            -H "X-GitHub-Api-Version: $api_version" \
+            "repos/$GITHUB_REPOSITORY/releases/$draft_id" \
+            -F draft=false >/dev/null
+
+          release_json="$(gh api -H "X-GitHub-Api-Version: $api_version" "repos/$GITHUB_REPOSITORY/releases/$draft_id")"
+          test "$(jq -r '.draft' <<<"$release_json")" = false
+          test "$(jq -r '.tag_name' <<<"$release_json")" = "$GITHUB_REF_NAME"
+          test "$(jq '.assets | length' <<<"$release_json")" -eq 16
+          for file in "${assets[@]}"; do
+            name="$(basename "$file")"
+            expected="sha256:$(sha256sum "$file" | awk '{print $1}')"
+            actual="$(jq -r --arg name "$name" '.assets[] | select(.name == $name) | .digest' <<<"$release_json")"
+            test "$actual" = "$expected"
+          done
+          verify_remote_tag

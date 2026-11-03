@@ -1,0 +1,964 @@
+name: Windows Netgen SDK
+
+on:
+  workflow_call:
+    inputs:
+      bundle_release:
+        type: boolean
+        default: false
+    outputs:
+      archive_name:
+        value: ${{ jobs.build.outputs.archive_name }}
+      checksum_name:
+        value: ${{ jobs.build.outputs.checksum_name }}
+      artifact_name:
+        value: ${{ jobs.build.outputs.artifact_name }}
+      static_archive_name:
+        value: ${{ jobs.static.outputs.archive_name }}
+      static_checksum_name:
+        value: ${{ jobs.static.outputs.checksum_name }}
+      static_artifact_name:
+        value: ${{ jobs.static.outputs.artifact_name }}
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  ZLIB_URL: https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz
+  ZLIB_SHA256: 9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23
+
+jobs:
+  build:
+    name: Build and qualify shared SDK
+    runs-on: windows-2022
+    outputs:
+      archive_name: ${{ steps.names.outputs.archive_name }}
+      checksum_name: ${{ steps.names.outputs.checksum_name }}
+      artifact_name: ${{ steps.names.outputs.artifact_name }}
+      source_prefix: ${{ steps.names.outputs.source_prefix }}
+      qualification_run_id: ${{ steps.provenance.outputs.qualification_run_id }}
+
+    steps:
+      - name: Check out exact producer commit
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          fetch-depth: 1
+
+      - name: Reconstruct pinned Netgen source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $source = "$env:RUNNER_TEMP\netgen-source"
+          $provenance = "$env:RUNNER_TEMP\source-provenance.json"
+          python scripts/prepare-netgen-source.py --destination $source --provenance $provenance
+          if($LASTEXITCODE -ne 0) { throw "Netgen source reconstruction failed." }
+          $identity = Get-Content -LiteralPath $provenance -Raw | ConvertFrom-Json
+          "NETGEN_SOURCE_DIR=$source" >> $env:GITHUB_ENV
+          "SOURCE_PROVENANCE=$provenance" >> $env:GITHUB_ENV
+          "NETGEN_VERSION=$($identity.upstream.version)" >> $env:GITHUB_ENV
+          "NETGEN_VERSION_GIT=$($identity.upstream.version_git)" >> $env:GITHUB_ENV
+
+      - name: Resolve immutable OCCT shared SDK
+        id: occt
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python .github/resolve-occt-release.py --platform windows --linkage shared --github-env --github-output
+
+      - name: Define artifact names
+        id: names
+        shell: pwsh
+        run: |
+          $prefix = $env:GITHUB_SHA.Substring(0, 12)
+          $archive = "netgen-featool-v$env:NETGEN_VERSION-$prefix-occt$env:OCCT_VERSION-win64-msvc.zip"
+          "source_prefix=$prefix" >> $env:GITHUB_OUTPUT
+          "archive_name=$archive" >> $env:GITHUB_OUTPUT
+          "checksum_name=$archive.sha256" >> $env:GITHUB_OUTPUT
+          "artifact_name=windows-netgen-sdk-$prefix" >> $env:GITHUB_OUTPUT
+
+      - name: Verify source and publication provenance
+        id: provenance
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUNDLE_RELEASE: ${{ inputs.bundle_release }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sha = $env:GITHUB_SHA.ToLowerInvariant()
+
+          $qualificationRunId = ""
+          $isTagPush = $env:GITHUB_REF.StartsWith("refs/tags/")
+          $isBundleRelease = $env:BUNDLE_RELEASE -eq "true"
+          if($env:GITHUB_EVENT_NAME -eq "push" -and $env:GITHUB_REF.StartsWith("refs/heads/")) {
+            if($env:GITHUB_REF -ne "refs/heads/main") {
+              throw "Branch qualification may only run for refs/heads/main."
+            }
+            $qualificationRunId = $env:GITHUB_RUN_ID
+          }
+          elseif($isTagPush) {
+            $tagPattern = if($isBundleRelease) {
+              '^refs/tags/netgen-sdk-([0-9a-fA-F]{12})-r([0-9]+)$'
+            }
+            else {
+              '^refs/tags/netgen-featool-sdk-([0-9a-fA-F]{12})-r([0-9]+)$'
+            }
+            if($env:GITHUB_REF -notmatch $tagPattern) {
+              if($isBundleRelease) {
+                throw "Combined release tag must match netgen-sdk-<12-char-source-sha>-rN."
+              }
+              throw "Release tag must match netgen-featool-sdk-<12-char-source-sha>-rN."
+            }
+            $tagPrefix = $Matches[1].ToLowerInvariant()
+            if($tagPrefix -ne $sha.Substring(0, 12)) {
+              throw "Release tag source prefix $tagPrefix does not match GITHUB_SHA $sha."
+            }
+
+            $qualificationRunId = (& python scripts/check-release-qualification.py `
+              --repository $env:GITHUB_REPOSITORY `
+              --workflow windows-netgen-sdk.yml `
+              --producer-sha $sha).Trim()
+            if($LASTEXITCODE -ne 0 -or -not $qualificationRunId) {
+              throw "No accepted exact-SHA Windows qualification exists for $sha."
+            }
+            Write-Host "Using prior branch qualification run $qualificationRunId for $sha."
+          }
+          else {
+            $qualificationRunId = $env:GITHUB_RUN_ID
+          }
+
+          "qualification_run_id=$qualificationRunId" >> $env:GITHUB_OUTPUT
+          "QUALIFICATION_RUN_ID=$qualificationRunId" >> $env:GITHUB_ENV
+
+      - name: Initialize VS2022 x64 tools and record toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vswhere = Join-Path ([Environment]::GetFolderPath("ProgramFilesX86")) "Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if($LASTEXITCODE -ne 0 -or -not $vs) {
+            throw "Visual Studio 2022 with the x64 C++ tools was not found."
+          }
+
+          $devCmd = Join-Path $vs "Common7\Tools\VsDevCmd.bat"
+          $cmdLine = 'call "' + $devCmd + '" -arch=amd64 -host_arch=amd64 >nul && set'
+          $devEnvironment = & cmd.exe /s /c $cmdLine
+          if($LASTEXITCODE -ne 0) {
+            throw "VsDevCmd.bat failed."
+          }
+          foreach($line in $devEnvironment) {
+            $separator = $line.IndexOf("=")
+            if($separator -lt 1) { continue }
+            $name = $line.Substring(0, $separator)
+            $value = $line.Substring($separator + 1)
+            Set-Item -Path "Env:$name" -Value $value
+          }
+
+          $cl = (Get-Command cl.exe -ErrorAction Stop).Source
+          $dumpbin = (Get-Command dumpbin.exe -ErrorAction Stop).Source
+          "CL_EXE=$cl" >> $env:GITHUB_ENV
+          "DUMPBIN=$dumpbin" >> $env:GITHUB_ENV
+
+          $cmakeVersion = (& cmake --version | Select-Object -First 1).Trim()
+          $clOutput = (& $cl /Bv 2>&1 | Out-String).Trim()
+          # cl /Bv reports version metadata and then returns D8003 without a
+          # translation unit. The diagnostic is expected for this probe.
+          $global:LASTEXITCODE = 0
+          Write-Host $cmakeVersion
+          Write-Host $clOutput
+          $compilerLine = (($clOutput -split '\r?\n') | Where-Object { $_ -match 'Compiler Version' } | Select-Object -First 1).Trim()
+          if(-not $compilerLine) {
+            $compilerLine = (($clOutput -split '\r?\n') | Select-Object -First 1).Trim()
+          }
+          $toolset = $env:VCToolsVersion
+          [pscustomobject]@{
+            runner_os = $env:RUNNER_OS
+            runner_arch = $env:RUNNER_ARCH
+            image_os = $env:ImageOS
+            image_version = $env:ImageVersion
+            cmake = $cmakeVersion
+            generator = "Visual Studio 17 2022"
+            architecture = "x64"
+            configuration = "Release"
+            msvc_toolset = $toolset
+            compiler = $compilerLine
+            runtime = "/MD (MultiThreadedDLL)"
+            cxx_standard = 17
+          } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath "$env:RUNNER_TEMP\toolchain.json"
+
+      - name: Restore checksum-addressed dependency archives
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: ${{ runner.temp }}/netgen-sdk-downloads
+          key: netgen-sdk-archives-${{ steps.occt.outputs.occt_sha256 }}-${{ env.ZLIB_SHA256 }}
+
+      - name: Download and qualify pinned OCCT
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $downloads = "$env:RUNNER_TEMP\netgen-sdk-downloads"
+          $archive = Join-Path $downloads $env:OCCT_ASSET
+          New-Item -ItemType Directory -Force -Path $downloads | Out-Null
+          if(-not (Test-Path -LiteralPath $archive)) {
+            $headers = @{
+              Authorization = "Bearer $env:GH_TOKEN"
+              Accept = "application/octet-stream"
+              "X-GitHub-Api-Version" = "2022-11-28"
+            }
+            Invoke-WebRequest -Headers $headers -Uri "https://api.github.com/repos/precise-simulation/OCCT-sdk/releases/assets/$env:OCCT_ASSET_ID" -OutFile $archive
+          }
+          $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($actual -ne $env:OCCT_SHA256) {
+            throw "OCCT SHA-256 mismatch: $actual"
+          }
+          if((Get-Item -LiteralPath $archive).Length -ne [int64]$env:OCCT_ASSET_SIZE) {
+            throw "OCCT shared archive size mismatch."
+          }
+
+          $extract = "$env:RUNNER_TEMP\occt-$env:OCCT_VERSION"
+          if(Test-Path -LiteralPath $extract) {
+            Remove-Item -LiteralPath $extract -Recurse -Force
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $extract
+
+          $roots = @(Get-ChildItem -LiteralPath $extract -Directory)
+          if($roots.Count -ne 1) {
+            throw "Expected exactly one OCCT shared SDK root, found $($roots.Count)."
+          }
+          $root = $roots[0].FullName
+          foreach($required in @("sdk-manifest.txt","cmake\OpenCASCADEConfig.cmake","inc","win64\vc14\lib","win64\vc14\bin")) {
+            if(-not (Test-Path -LiteralPath (Join-Path $root $required))) {
+              throw "OCCT shared SDK root is missing $required."
+            }
+          }
+          $manifest = @(Get-Content -LiteralPath (Join-Path $root "sdk-manifest.txt"))
+          $sourceLine = @($manifest | Where-Object { $_ -match '^occt-source-sha=([0-9a-fA-F]{40})$' })
+          if($sourceLine.Count -ne 1) { throw "OCCT shared manifest must contain exactly one full source SHA." }
+          $sourceSha = ($sourceLine[0] -split '=', 2)[1].ToLowerInvariant()
+          if(-not $sourceSha.StartsWith($env:OCCT_SOURCE_PREFIX)) { throw "OCCT shared source SHA does not match the release asset name." }
+          foreach($expected in @(
+            "occt-version=$env:OCCT_VERSION",
+            "platform=windows-x86_64",
+            "msvc-toolset=vc143",
+            "msvc-runtime=MultiThreadedDLL",
+            "linkage=shared",
+            "profile=lean",
+            "build-opt-profile=Production",
+            "optional-third-party=none",
+            "toolkit-count=28"
+          )) {
+            if($manifest -notcontains $expected) { throw "OCCT shared manifest is missing: $expected" }
+          }
+          "OCCT_SOURCE_SHA=$sourceSha" >> $env:GITHUB_ENV
+          "OCCT_ROOT=$root" >> $env:GITHUB_ENV
+          Write-Host "OCCT root: $root"
+
+          $runtimeDirs = @("$root\win64\vc14\bin")
+          "OCCT_RUNTIME_PATH=$($runtimeDirs -join ';')" >> $env:GITHUB_ENV
+
+          $configuredOcctLibraries = @(
+            "TKBO","TKBRep","TKBool","TKCAF","TKCDF","TKFillet","TKG2d","TKG3d",
+            "TKGeomAlgo","TKGeomBase","TKHLR","TKLCAF","TKMath","TKMesh","TKOffset",
+            "TKPrim","TKService","TKShHealing","TKTopAlgo","TKV3d","TKVCAF","TKXCAF",
+            "TKXSBase","TKernel","TKDEIGES","TKDESTEP","TKDESTL"
+          )
+          $evidence = @()
+          foreach($name in $configuredOcctLibraries) {
+            $dll = Join-Path $root "win64\vc14\bin\$name.dll"
+            if(-not (Test-Path -LiteralPath $dll)) {
+              throw "Pinned OCCT package is missing $name.dll."
+            }
+            $importsText = (& $env:DUMPBIN /dependents $dll 2>&1 | Out-String)
+            if($LASTEXITCODE -ne 0) {
+              throw "dumpbin failed for $dll."
+            }
+            if($importsText -match '(?i)LIBCMT') {
+              throw "$name.dll contains evidence of the static MSVC CRT."
+            }
+            $imports = @([regex]::Matches($importsText, '(?im)^\s*([A-Za-z0-9_.+-]+\.dll)\s*$') |
+              ForEach-Object { $_.Groups[1].Value } |
+              Sort-Object -Unique)
+            $evidence += [pscustomobject]@{ dll = "$name.dll"; imports = $imports }
+          }
+          $coreEvidence = @($evidence | Where-Object { $_.dll -in @("TKernel.dll","TKMath.dll","TKBRep.dll") })
+          $dynamicCrt = @($coreEvidence.imports | Where-Object {
+            $_ -match '^(?i)(VCRUNTIME|MSVCP|api-ms-win-crt|ucrtbase)'
+          })
+          if($dynamicCrt.Count -eq 0) {
+            throw "Core OCCT DLLs do not expose dynamic MSVC CRT/UCRT imports."
+          }
+          [pscustomobject]@{
+            asset_url = $env:OCCT_URL
+            sha256 = $env:OCCT_SHA256
+            package_family = "OCCT $env:OCCT_VERSION lean vc143 shared /MD SDK"
+            inspection = "dumpbin /dependents on every OCCT DLL named by the Netgen OCC link set"
+            observed_dynamic_crt_imports = @($dynamicCrt | Sort-Object -Unique)
+            libraries = $evidence
+          } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath "$env:RUNNER_TEMP\occt-runtime.json"
+
+      - name: Build and qualify pinned zlib
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $downloads = "$env:RUNNER_TEMP\netgen-sdk-downloads"
+          $archive = Join-Path $downloads "zlib-1.3.1.tar.gz"
+          New-Item -ItemType Directory -Force -Path $downloads | Out-Null
+          if(-not (Test-Path -LiteralPath $archive)) {
+            Invoke-WebRequest -Uri $env:ZLIB_URL -OutFile $archive
+          }
+          $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($actual -ne $env:ZLIB_SHA256) {
+            throw "zlib SHA-256 mismatch: $actual"
+          }
+
+          $srcParent = "$env:RUNNER_TEMP\zlib-src"
+          $build = "$env:RUNNER_TEMP\zlib-build"
+          $stage = "$env:RUNNER_TEMP\zlib-stage"
+          foreach($path in @($srcParent, $build, $stage)) {
+            if(Test-Path -LiteralPath $path) {
+              Remove-Item -LiteralPath $path -Recurse -Force
+            }
+            New-Item -ItemType Directory -Force -Path $path | Out-Null
+          }
+          Push-Location $srcParent
+          try {
+            cmake -E tar xzf $archive
+            if($LASTEXITCODE -ne 0) { throw "Could not extract zlib." }
+          }
+          finally {
+            Pop-Location
+          }
+          $src = Get-ChildItem -LiteralPath $srcParent -Directory | Where-Object Name -eq "zlib-1.3.1" | Select-Object -First 1
+          if(-not $src) {
+            throw "Extracted zlib-1.3.1 source directory was not found."
+          }
+
+          $zlibConfigure = @(
+            "-S", $src.FullName,
+            "-B", $build,
+            "-G", "Visual Studio 17 2022",
+            "-A", "x64",
+            "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL",
+            "-DZLIB_BUILD_EXAMPLES=OFF"
+          )
+          & cmake @zlibConfigure
+          if($LASTEXITCODE -ne 0) { throw "zlib configure failed." }
+          cmake --build $build --config Release --target zlibstatic
+          if($LASTEXITCODE -ne 0) { throw "zlibstatic build failed." }
+
+          $library = Get-ChildItem -LiteralPath $build -Recurse -File -Filter "zlibstatic.lib" |
+            Where-Object { $_.FullName -match '\\Release\\zlibstatic\.lib$' } |
+            Select-Object -First 1
+          if(-not $library) {
+            throw "zlibstatic.lib was not produced."
+          }
+          $directives = (& $env:DUMPBIN /directives $library.FullName 2>&1 | Out-String)
+          if($LASTEXITCODE -ne 0) {
+            throw "dumpbin /directives failed for zlibstatic.lib."
+          }
+          if($directives -match '(?i)DEFAULTLIB:"?LIBCMT') {
+            throw "zlibstatic.lib was built against the static MSVC CRT."
+          }
+          if($directives -notmatch '(?i)DEFAULTLIB:"?MSVCRT') {
+            throw "zlibstatic.lib does not contain the expected /MD MSVCRT directive."
+          }
+
+          New-Item -ItemType Directory -Force -Path "$stage\include", "$stage\lib" | Out-Null
+          Copy-Item -LiteralPath "$($src.FullName)\zlib.h" -Destination "$stage\include\zlib.h"
+          Copy-Item -LiteralPath "$build\zconf.h" -Destination "$stage\include\zconf.h"
+          Copy-Item -LiteralPath $library.FullName -Destination "$stage\lib\zlibstatic.lib"
+          "ZLIB_STAGE=$stage" >> $env:GITHUB_ENV
+          [pscustomobject]@{
+            source_url = $env:ZLIB_URL
+            sha256 = $env:ZLIB_SHA256
+            generator = "Visual Studio 17 2022"
+            architecture = "x64"
+            configuration = "Release"
+            runtime = "/MD (MultiThreadedDLL)"
+            target = "zlibstatic"
+            directive_evidence = @($directives -split '\r?\n' | Where-Object { $_ -match '(?i)DEFAULTLIB:' } | ForEach-Object { $_.Trim() })
+          } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath "$env:RUNNER_TEMP\zlib-runtime.json"
+
+      - name: Configure and build Netgen
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $build = "$env:RUNNER_TEMP\netgen-build"
+          $install = "$env:RUNNER_TEMP\netgen-install"
+          foreach($path in @($build, $install)) {
+            if(Test-Path -LiteralPath $path) {
+              Remove-Item -LiteralPath $path -Recurse -Force
+            }
+          }
+          $zlibLib = "$env:ZLIB_STAGE\lib\zlibstatic.lib"
+          $netgenConfigure = @(
+            "-S", $env:NETGEN_SOURCE_DIR,
+            "-B", $build,
+            "-G", "Visual Studio 17 2022",
+            "-A", "x64",
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DCMAKE_INSTALL_PREFIX=$install",
+            "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL",
+            "-DCMAKE_FIND_USE_PACKAGE_REGISTRY=FALSE",
+            "-DCMAKE_FIND_USE_SYSTEM_PACKAGE_REGISTRY=FALSE",
+            "-DUSE_SUPERBUILD=OFF",
+            "-DUSE_GUI=OFF",
+            "-DUSE_PYTHON=OFF",
+            "-DUSE_MPI=OFF",
+            "-DUSE_CGNS=OFF",
+            "-DUSE_JPEG=OFF",
+            "-DUSE_MPEG=OFF",
+            "-DUSE_STLGEOM=ON",
+            "-DUSE_INTERFACE=ON",
+            "-DUSE_CSG=ON",
+            "-DUSE_GEOM2D=ON",
+            "-DUSE_NATIVE_ARCH=OFF",
+            "-DUSE_OCC=ON",
+            "-DNGLIB_LIBRARY_TYPE=SHARED",
+            "-DNGCORE_LIBRARY_TYPE=SHARED",
+            "-DNETGEN_NATIVE_SDK=ON",
+            "-DENABLE_UNIT_TESTS=ON",
+            "-DNETGEN_VERSION_GIT=$env:NETGEN_VERSION_GIT",
+            "-DOpenCascade_DIR=$env:OCCT_ROOT\cmake",
+            "-DZLIB_INCLUDE_DIRS=$env:ZLIB_STAGE\include",
+            "-DZLIB_LIBRARIES=$zlibLib",
+            "-DZLIB_LIBRARY_RELEASE=$zlibLib"
+          )
+          & cmake @netgenConfigure
+          if($LASTEXITCODE -ne 0) { throw "Netgen configure failed." }
+
+          cmake --build $build --config Release --target unit_tests
+          if($LASTEXITCODE -ne 0) { throw "Netgen native unit-test build failed." }
+          "NETGEN_BUILD=$build" >> $env:GITHUB_ENV
+          "NETGEN_INSTALL=$install" >> $env:GITHUB_ENV
+
+      - name: Prepare build-tree runtime path
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ngcore = Get-ChildItem -LiteralPath $env:NETGEN_BUILD -Recurse -File -Filter "ngcore.dll" |
+            Where-Object { $_.FullName -match '\\Release\\ngcore\.dll$' } |
+            Select-Object -First 1
+          $nglib = Get-ChildItem -LiteralPath $env:NETGEN_BUILD -Recurse -File -Filter "nglib.dll" |
+            Where-Object { $_.FullName -match '\\Release\\nglib\.dll$' } |
+            Select-Object -First 1
+          if(-not $ngcore -or -not $nglib) {
+            throw "Could not locate Release ngcore.dll/nglib.dll in the build tree."
+          }
+          $runtimeDirs = @($ngcore.Directory.FullName, $nglib.Directory.FullName) + @($env:OCCT_RUNTIME_PATH -split ';')
+          $runtimeDirs = @($runtimeDirs | Where-Object { $_ } | Select-Object -Unique)
+          "NETGEN_TEST_RUNTIME_PATH=$($runtimeDirs -join ';')" >> $env:GITHUB_ENV
+
+      - name: Run focused refinement qualification
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:PATH = "$env:NETGEN_TEST_RUNTIME_PATH;$env:PATH"
+          $test = Get-ChildItem -LiteralPath "$env:NETGEN_BUILD\tests\catch" -Recurse -File -Filter "test_refinement.exe" |
+            Where-Object { $_.FullName -match '\\Release\\test_refinement\.exe$' } |
+            Select-Object -First 1
+          if(-not $test) {
+            throw "test_refinement.exe was not produced."
+          }
+          & $test.FullName "Uniform refinement can convert a triangle to three quads"
+          if($LASTEXITCODE -ne 0) {
+            throw "Focused triangle-to-three-quads regression failed."
+          }
+          & $test.FullName "Uniform refinement still refines a quad to four quads"
+          if($LASTEXITCODE -ne 0) {
+            throw "Focused ordinary quad refinement regression failed."
+          }
+
+      - name: Run native Catch unit surface
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:PATH = "$env:NETGEN_TEST_RUNTIME_PATH;$env:PATH"
+          ctest --test-dir $env:NETGEN_BUILD -C Release -R "^unit_" --output-on-failure
+          if($LASTEXITCODE -ne 0) {
+            throw "Native Catch unit surface failed."
+          }
+
+      - name: Install and construct compact SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cmake --install $env:NETGEN_BUILD --config Release
+          if($LASTEXITCODE -ne 0) {
+            throw "Netgen install failed."
+          }
+
+          $sdk = "$env:RUNNER_TEMP\netgen-sdk"
+          if(Test-Path -LiteralPath $sdk) {
+            Remove-Item -LiteralPath $sdk -Recurse -Force
+          }
+          New-Item -ItemType Directory -Force -Path "$sdk\include", "$sdk\lib", "$sdk\bin", "$sdk\cmake" | Out-Null
+          Copy-Item -Path "$env:NETGEN_INSTALL\include\*" -Destination "$sdk\include" -Recurse
+          foreach($file in @("ngcore.lib","nglib.lib")) {
+            Copy-Item -LiteralPath "$env:NETGEN_INSTALL\lib\$file" -Destination "$sdk\lib\$file"
+          }
+          foreach($file in @("ngcore.dll","nglib.dll")) {
+            Copy-Item -LiteralPath "$env:NETGEN_INSTALL\bin\$file" -Destination "$sdk\bin\$file"
+          }
+          foreach($file in @("NetgenConfig.cmake","netgen-targets.cmake","netgen-targets-release.cmake")) {
+            Copy-Item -LiteralPath "$env:NETGEN_INSTALL\cmake\$file" -Destination "$sdk\cmake\$file"
+          }
+          "SDK_ROOT=$sdk" >> $env:GITHUB_ENV
+
+      - name: Audit native DLL and package metadata
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          function Get-Imports([string]$path) {
+            $text = (& $env:DUMPBIN /dependents $path 2>&1 | Out-String)
+            if($LASTEXITCODE -ne 0) {
+              throw "dumpbin /dependents failed for $path."
+            }
+            return @([regex]::Matches($text, '(?im)^\s*([A-Za-z0-9_.+-]+\.dll)\s*$') |
+              ForEach-Object { $_.Groups[1].Value } |
+              Sort-Object -Unique)
+          }
+          function Is-SystemRuntime([string]$name) {
+            if($name -match '^(?i)(api-ms-win-|ext-ms-win-)') { return $true }
+            return Test-Path -LiteralPath (Join-Path "$env:SystemRoot\System32" $name)
+          }
+
+          $sdk = $env:SDK_ROOT
+          foreach($dllName in @("ngcore.dll","nglib.dll")) {
+            $dll = "$sdk\bin\$dllName"
+            $headers = (& $env:DUMPBIN /headers $dll 2>&1 | Out-String)
+            if($LASTEXITCODE -ne 0 -or $headers -notmatch '(?i)machine\s+\(x64\)') {
+              throw "$dllName is not an AMD64 PE image."
+            }
+            $imports = Get-Imports $dll
+            if(-not ($imports | Where-Object { $_ -match '^(?i)(VCRUNTIME|MSVCP|api-ms-win-crt|ucrtbase)' })) {
+              throw "$dllName does not import the shared MSVC CRT/UCRT family."
+            }
+            if($imports | Where-Object { $_ -match '(?i)(zlib1|python|tcl|tk[0-9]|msmpi|mpi|cgns).*\.dll$' }) {
+              throw "$dllName contains a disabled-feature runtime dependency: $($imports -join ', ')"
+            }
+          }
+
+          foreach($libName in @("ngcore.lib","nglib.lib")) {
+            $members = (& $env:DUMPBIN /linkermember:1 "$sdk\lib\$libName" 2>&1 | Out-String)
+            if($LASTEXITCODE -ne 0 -or -not $members.Trim()) {
+              throw "$libName is not a readable import library."
+            }
+          }
+
+          $cmakeFiles = @(Get-ChildItem -LiteralPath "$sdk\cmake" -File -Filter "*.cmake")
+          $forbiddenPaths = @($env:GITHUB_WORKSPACE, $env:NETGEN_SOURCE_DIR, $env:NETGEN_BUILD, $env:NETGEN_INSTALL, $env:OCCT_ROOT, $env:ZLIB_STAGE)
+          foreach($file in $cmakeFiles) {
+            $text = Get-Content -LiteralPath $file.FullName -Raw
+            foreach($path in $forbiddenPaths) {
+              if(-not $path) { continue }
+              foreach($form in @($path, ($path -replace '\\','/'))) {
+                if($text -match [regex]::Escape($form)) {
+                  throw "$($file.Name) contains producer path $form."
+                }
+              }
+            }
+            if($text -match '(?i)(netgen_cgns|netgen_python|netgen_gui|pyngcore|ngpy|nggui)') {
+              throw "$($file.Name) exports a disabled target."
+            }
+            if($text -match '(?i)/arch:AVX(2|512)?') {
+              throw "$($file.Name) contains a native AVX architecture requirement."
+            }
+          }
+
+          $known = @{}
+          Get-ChildItem -LiteralPath "$env:OCCT_ROOT\win64\vc14\bin" -File -Filter "*.dll" | ForEach-Object {
+            $key = $_.Name.ToLowerInvariant()
+            if(-not $known.ContainsKey($key)) {
+              $known[$key] = $_.FullName
+            }
+          }
+
+          $queue = New-Object System.Collections.Generic.Queue[string]
+          foreach($rootDll in @("$sdk\bin\ngcore.dll", "$sdk\bin\nglib.dll")) {
+            foreach($import in (Get-Imports $rootDll)) {
+              if(-not (Is-SystemRuntime $import) -and $import -notmatch '^(?i)ng(core|lib)\.dll$') {
+                $queue.Enqueue($import)
+              }
+            }
+          }
+          $closure = [ordered]@{}
+          $occtDynamicCrtEvidence = @()
+          $occtBin = (Resolve-Path -LiteralPath "$env:OCCT_ROOT\win64\vc14\bin").Path.TrimEnd('\')
+          while($queue.Count -gt 0) {
+            $name = $queue.Dequeue()
+            $key = $name.ToLowerInvariant()
+            if($closure.Contains($key)) { continue }
+            if(-not $known.ContainsKey($key)) {
+              throw "Non-system dependency $name is not present in the pinned lean OCCT SDK."
+            }
+            $path = $known[$key]
+            $closure[$key] = $path
+            $imports = @(Get-Imports $path)
+            $parent = (Split-Path -Parent $path).TrimEnd('\')
+            if($parent -ieq $occtBin) {
+              $crtImports = @($imports | Where-Object {
+                $_ -match '^(?i)(VCRUNTIME|MSVCP|api-ms-win-crt|ucrtbase)'
+              })
+              if($crtImports.Count -eq 0) {
+                throw "OCCT runtime-closure DLL $name does not expose dynamic MSVC CRT/UCRT imports; /MD compatibility is not established."
+              }
+              $occtDynamicCrtEvidence += [pscustomobject]@{
+                dll = $name
+                dynamic_crt_imports = @($crtImports | Sort-Object -Unique)
+              }
+            }
+            foreach($import in $imports) {
+              $importKey = $import.ToLowerInvariant()
+              if(-not (Is-SystemRuntime $import) -and
+                 $import -notmatch '^(?i)ng(core|lib)\.dll$' -and
+                 -not $closure.Contains($importKey)) {
+                $queue.Enqueue($import)
+              }
+            }
+          }
+
+          $runtimeDirs = @($closure.Values | ForEach-Object { Split-Path -Parent $_ } | Sort-Object -Unique)
+          $runtimeDirs | Set-Content -LiteralPath "$env:RUNNER_TEMP\occt-runtime-dirs.txt"
+          $relativeFiles = @($closure.Values | ForEach-Object {
+            $_.Substring($env:OCCT_ROOT.Length).TrimStart('\') -replace '\\','/'
+          })
+          $relativeRuntimeDirs = @($runtimeDirs | ForEach-Object {
+            $_.Substring($env:OCCT_ROOT.Length).TrimStart('\') -replace '\\','/'
+          })
+          [pscustomobject]@{
+            dependency_names = @($closure.Keys)
+            dependency_files = $relativeFiles
+            runtime_directories = $relativeRuntimeDirs
+            occt_dynamic_crt_evidence = $occtDynamicCrtEvidence
+          } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath "$env:RUNNER_TEMP\occt-closure.json"
+
+      - name: Generate producer metadata
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sdk = $env:SDK_ROOT
+          $sourceProvenance = Get-Content -LiteralPath $env:SOURCE_PROVENANCE -Raw | ConvertFrom-Json
+          $toolchain = Get-Content -LiteralPath "$env:RUNNER_TEMP\toolchain.json" -Raw | ConvertFrom-Json
+          $occtEvidence = Get-Content -LiteralPath "$env:RUNNER_TEMP\occt-runtime.json" -Raw | ConvertFrom-Json
+          $occtClosure = Get-Content -LiteralPath "$env:RUNNER_TEMP\occt-closure.json" -Raw | ConvertFrom-Json
+          $zlibEvidence = Get-Content -LiteralPath "$env:RUNNER_TEMP\zlib-runtime.json" -Raw | ConvertFrom-Json
+
+          $hashPaths = [ordered]@{
+            "bin/ngcore.dll" = "$sdk\bin\ngcore.dll"
+            "bin/nglib.dll" = "$sdk\bin\nglib.dll"
+            "lib/ngcore.lib" = "$sdk\lib\ngcore.lib"
+            "lib/nglib.lib" = "$sdk\lib\nglib.lib"
+            "cmake/NetgenConfig.cmake" = "$sdk\cmake\NetgenConfig.cmake"
+            "cmake/netgen-targets.cmake" = "$sdk\cmake\netgen-targets.cmake"
+            "cmake/netgen-targets-release.cmake" = "$sdk\cmake\netgen-targets-release.cmake"
+          }
+          $hashes = [ordered]@{}
+          foreach($entry in $hashPaths.GetEnumerator()) {
+            $hashes[$entry.Key] = (Get-FileHash -LiteralPath $entry.Value -Algorithm SHA256).Hash.ToLowerInvariant()
+          }
+
+          $info = [ordered]@{
+            schema_version = 2
+            upstream = $sourceProvenance.upstream
+            source = [ordered]@{
+              repository = $env:GITHUB_REPOSITORY
+              ref = $env:GITHUB_REF
+              commit = $env:GITHUB_SHA
+              patches = @($sourceProvenance.patches)
+              workflow_run_id = $env:GITHUB_RUN_ID
+              workflow_run_attempt = $env:GITHUB_RUN_ATTEMPT
+              qualification_run_id = $env:QUALIFICATION_RUN_ID
+            }
+            toolchain = $toolchain
+            netgen = [ordered]@{
+              configuration = "Release"
+              cxx_standard = 17
+              linkage = "shared"
+              msvc_runtime = "MultiThreadedDLL"
+              options = [ordered]@{
+                USE_SUPERBUILD = $false
+                USE_GUI = $false
+                USE_PYTHON = $false
+                USE_MPI = $false
+                USE_CGNS = $false
+                USE_JPEG = $false
+                USE_MPEG = $false
+                USE_STLGEOM = $true
+                USE_INTERFACE = $true
+                USE_CSG = $true
+                USE_GEOM2D = $true
+                USE_NATIVE_ARCH = $false
+                USE_OCC = $true
+                NGLIB_LIBRARY_TYPE = "SHARED"
+                NGCORE_LIBRARY_TYPE = "SHARED"
+                NETGEN_NATIVE_SDK = $true
+                ENABLE_UNIT_TESTS = $true
+              }
+            }
+            occt = [ordered]@{
+              version = $env:OCCT_VERSION
+              release = $env:OCCT_RELEASE
+              commit = $env:OCCT_SOURCE_SHA
+              linkage = "shared"
+              asset_id = [int64]$env:OCCT_ASSET_ID
+              asset_name = $env:OCCT_ASSET
+              asset_url = $env:OCCT_URL
+              sha256 = $env:OCCT_SHA256
+              runtime_evidence = $occtEvidence
+              runtime_closure = $occtClosure
+            }
+            zlib = $zlibEvidence
+            artifact_hashes = $hashes
+          }
+          $info | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath "$sdk\producer-info.json"
+
+      - name: Qualify staged SDK consumer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $consumerBuild = "$env:RUNNER_TEMP\consumer-stage-build"
+          if(Test-Path -LiteralPath $consumerBuild) {
+            Remove-Item -LiteralPath $consumerBuild -Recurse -Force
+          }
+          $consumerConfigure = @(
+            "-S", "$env:GITHUB_WORKSPACE\tests\windows-native-sdk",
+            "-B", $consumerBuild,
+            "-G", "Visual Studio 17 2022",
+            "-A", "x64",
+            "-DNETGEN_SDK_DIR=$env:SDK_ROOT",
+            "-DEXPECTED_NETGEN_VERSION=$env:NETGEN_VERSION",
+            "-DOCCT_INCLUDE_DIR=$env:OCCT_ROOT\inc"
+          )
+          & cmake @consumerConfigure
+          if($LASTEXITCODE -ne 0) { throw "Staged SDK consumer configure failed." }
+          cmake --build $consumerBuild --config Release
+          if($LASTEXITCODE -ne 0) { throw "Staged SDK consumer build failed." }
+
+          $exe = "$consumerBuild\Release\netgen_native_sdk_smoke.exe"
+          if(-not (Test-Path -LiteralPath $exe)) { throw "Staged SDK consumer executable is missing." }
+          $runtimeDirs = @(Get-Content -LiteralPath "$env:RUNNER_TEMP\occt-runtime-dirs.txt")
+          $env:PATH = (@("$env:SDK_ROOT\bin") + $runtimeDirs + @("$env:SystemRoot\System32", "$env:SystemRoot")) -join ";"
+          & $exe "$env:GITHUB_WORKSPACE\tests\windows-native-sdk\vertex.brep" $env:NETGEN_VERSION
+          if($LASTEXITCODE -ne 0) { throw "Staged SDK OCC-backed runtime smoke test failed." }
+
+      - name: Archive, relocate, and requalify SDK
+        shell: pwsh
+        env:
+          ARCHIVE_NAME: ${{ steps.names.outputs.archive_name }}
+          CHECKSUM_NAME: ${{ steps.names.outputs.checksum_name }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $qualified = "$env:RUNNER_TEMP\qualified-assets"
+          if(Test-Path -LiteralPath $qualified) {
+            Remove-Item -LiteralPath $qualified -Recurse -Force
+          }
+          New-Item -ItemType Directory -Force -Path $qualified | Out-Null
+          $archive = Join-Path $qualified $env:ARCHIVE_NAME
+          $sidecar = Join-Path $qualified $env:CHECKSUM_NAME
+
+          Compress-Archive -Path "$env:SDK_ROOT\*" -DestinationPath $archive -CompressionLevel Optimal
+          $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $env:ARCHIVE_NAME" | Set-Content -LiteralPath $sidecar -NoNewline
+
+          Remove-Item -LiteralPath $env:SDK_ROOT -Recurse -Force
+          Remove-Item -LiteralPath $env:NETGEN_INSTALL -Recurse -Force
+          $relocated = "$env:RUNNER_TEMP\relocated-sdk"
+          if(Test-Path -LiteralPath $relocated) {
+            Remove-Item -LiteralPath $relocated -Recurse -Force
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $relocated
+
+          $topLevel = @(Get-ChildItem -LiteralPath $relocated | Select-Object -ExpandProperty Name | Sort-Object)
+          $expectedTopLevel = @("bin","cmake","include","lib","producer-info.json") | Sort-Object
+          if(Compare-Object $topLevel $expectedTopLevel) {
+            throw "Relocated SDK top-level layout is not the producer contract: $($topLevel -join ', ')"
+          }
+          $binFiles = @(Get-ChildItem -LiteralPath "$relocated\bin" -File | Select-Object -ExpandProperty Name | Sort-Object)
+          if(Compare-Object $binFiles @("ngcore.dll","nglib.dll")) {
+            throw "Relocated SDK bin directory contains unexpected files: $($binFiles -join ', ')"
+          }
+          $libFiles = @(Get-ChildItem -LiteralPath "$relocated\lib" -File | Select-Object -ExpandProperty Name | Sort-Object)
+          if(Compare-Object $libFiles @("ngcore.lib","nglib.lib")) {
+            throw "Relocated SDK lib directory contains unexpected files: $($libFiles -join ', ')"
+          }
+          $cmakeFiles = @(Get-ChildItem -LiteralPath "$relocated\cmake" -File | Select-Object -ExpandProperty Name | Sort-Object)
+          $expectedCmake = @("NetgenConfig.cmake","netgen-targets-release.cmake","netgen-targets.cmake") | Sort-Object
+          if(Compare-Object $cmakeFiles $expectedCmake) {
+            throw "Relocated SDK cmake directory contains unexpected files: $($cmakeFiles -join ', ')"
+          }
+
+          foreach($required in @(
+            "include",
+            "lib\ngcore.lib",
+            "lib\nglib.lib",
+            "bin\ngcore.dll",
+            "bin\nglib.dll",
+            "cmake\NetgenConfig.cmake",
+            "cmake\netgen-targets.cmake",
+            "cmake\netgen-targets-release.cmake",
+            "producer-info.json"
+          )) {
+            if(-not (Test-Path -LiteralPath (Join-Path $relocated $required))) {
+              throw "Relocated archive is missing $required."
+            }
+          }
+          $forbidden = @(Get-ChildItem -LiteralPath $relocated -Recurse -File |
+            Where-Object { $_.Extension -in @(".exe",".pyd",".cpp",".cxx",".cc",".c") })
+          if($forbidden.Count -gt 0) {
+            throw "Relocated SDK contains forbidden files: $($forbidden.FullName -join ', ')"
+          }
+
+          $consumerBuild = "$env:RUNNER_TEMP\consumer-relocated-build"
+          if(Test-Path -LiteralPath $consumerBuild) {
+            Remove-Item -LiteralPath $consumerBuild -Recurse -Force
+          }
+          $consumerConfigure = @(
+            "-S", "$env:GITHUB_WORKSPACE\tests\windows-native-sdk",
+            "-B", $consumerBuild,
+            "-G", "Visual Studio 17 2022",
+            "-A", "x64",
+            "-DNETGEN_SDK_DIR=$relocated",
+            "-DEXPECTED_NETGEN_VERSION=$env:NETGEN_VERSION",
+            "-DOCCT_INCLUDE_DIR=$env:OCCT_ROOT\inc"
+          )
+          & cmake @consumerConfigure
+          if($LASTEXITCODE -ne 0) { throw "Relocated SDK consumer configure failed." }
+          cmake --build $consumerBuild --config Release
+          if($LASTEXITCODE -ne 0) { throw "Relocated SDK consumer build failed." }
+
+          $exe = "$consumerBuild\Release\netgen_native_sdk_smoke.exe"
+          $runtimeDirs = @(Get-Content -LiteralPath "$env:RUNNER_TEMP\occt-runtime-dirs.txt")
+          $env:PATH = (@("$relocated\bin") + $runtimeDirs + @("$env:SystemRoot\System32", "$env:SystemRoot")) -join ";"
+          & $exe "$env:GITHUB_WORKSPACE\tests\windows-native-sdk\vertex.brep" $env:NETGEN_VERSION
+          if($LASTEXITCODE -ne 0) { throw "Relocated SDK OCC-backed runtime smoke test failed." }
+
+          $sidecarHash = ((Get-Content -LiteralPath $sidecar -Raw) -split '\s+')[0].ToLowerInvariant()
+          $archiveHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($sidecarHash -ne $archiveHash) {
+            throw "Archive checksum sidecar does not match the final ZIP."
+          }
+
+      - name: Upload qualified workflow artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: ${{ steps.names.outputs.artifact_name }}
+          path: ${{ runner.temp }}/qualified-assets/*
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 30
+  static:
+    name: Build and qualify static SDK
+    needs: build
+    runs-on: windows-2022
+    timeout-minutes: 180
+    outputs:
+      archive_name: ${{ steps.names.outputs.archive_name }}
+      checksum_name: ${{ steps.names.outputs.checksum_name }}
+      artifact_name: ${{ steps.names.outputs.artifact_name }}
+    steps:
+      - name: Check out exact producer commit
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          fetch-depth: 1
+
+      - name: Reconstruct pinned Netgen source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $source = "$env:RUNNER_TEMP\netgen-source"
+          $provenance = "$env:RUNNER_TEMP\source-provenance.json"
+          python scripts/prepare-netgen-source.py --destination $source --provenance $provenance
+          if($LASTEXITCODE -ne 0) { throw "Netgen source reconstruction failed." }
+          $identity = Get-Content -LiteralPath $provenance -Raw | ConvertFrom-Json
+          "NETGEN_SOURCE_DIR=$source" >> $env:GITHUB_ENV
+          "SOURCE_PROVENANCE=$provenance" >> $env:GITHUB_ENV
+          "NETGEN_VERSION=$($identity.upstream.version)" >> $env:GITHUB_ENV
+          "NETGEN_VERSION_GIT=$($identity.upstream.version_git)" >> $env:GITHUB_ENV
+
+      - name: Resolve immutable OCCT static SDK
+        id: occt
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python .github/resolve-occt-release.py --platform windows --linkage static --github-env --github-output
+
+      - name: Download and qualify pinned static OCCT
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $downloads = Join-Path $env:RUNNER_TEMP "netgen-sdk-downloads"
+          New-Item -ItemType Directory -Force -Path $downloads | Out-Null
+          $archive = Join-Path $downloads $env:OCCT_ASSET
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = "application/octet-stream"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          Invoke-WebRequest -Headers $headers -Uri "https://api.github.com/repos/precise-simulation/OCCT-sdk/releases/assets/$env:OCCT_ASSET_ID" -OutFile $archive
+          $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if($actual -ne $env:OCCT_SHA256) { throw "OCCT static SHA-256 mismatch: $actual" }
+          if((Get-Item -LiteralPath $archive).Length -ne [int64]$env:OCCT_ASSET_SIZE) { throw "OCCT static archive size mismatch." }
+
+          $extract = Join-Path $env:RUNNER_TEMP "occt-static-input"
+          if(Test-Path -LiteralPath $extract) { Remove-Item -LiteralPath $extract -Recurse -Force }
+          Expand-Archive -LiteralPath $archive -DestinationPath $extract
+          $roots = @(Get-ChildItem -LiteralPath $extract -Directory)
+          if($roots.Count -ne 1) { throw "Expected exactly one OCCT static SDK root, found $($roots.Count)." }
+          $root = $roots[0].FullName
+          $manifest = @(Get-Content -LiteralPath (Join-Path $root "sdk-manifest.txt"))
+          $sourceLine = @($manifest | Where-Object { $_ -match '^occt-source-sha=([0-9a-fA-F]{40})$' })
+          if($sourceLine.Count -ne 1) { throw "OCCT static manifest must contain exactly one full source SHA." }
+          $sourceSha = ($sourceLine[0] -split '=', 2)[1].ToLowerInvariant()
+          if(-not $sourceSha.StartsWith($env:OCCT_SOURCE_PREFIX)) { throw "OCCT static source SHA does not match the release asset name." }
+          foreach($expected in @(
+            "occt-version=$env:OCCT_VERSION",
+            "platform=windows-x86_64",
+            "msvc-toolset=vc143",
+            "msvc-runtime=MultiThreadedDLL",
+            "linkage=static",
+            "profile=lean",
+            "toolkit-count=28",
+            "consumer-definitions=OCCT_STATIC_BUILD;OCCT_NO_PLUGINS",
+            "consumer-system-libs=advapi32;gdi32;user32;wsock32;psapi;windowscodecs;winmm"
+          )) {
+            if($manifest -notcontains $expected) { throw "OCCT static manifest is missing: $expected" }
+          }
+          "OCCT_SOURCE_SHA=$sourceSha" >> $env:GITHUB_ENV
+          "OCCT_STATIC_ROOT=$root" >> $env:GITHUB_ENV
+
+      - name: Define static artifact names
+        id: names
+        shell: pwsh
+        run: |
+          $prefix = $env:GITHUB_SHA.Substring(0, 12)
+          $archive = "netgen-featool-v$env:NETGEN_VERSION-$prefix-occt$env:OCCT_VERSION-win64-msvc-static.zip"
+          "archive_name=$archive" >> $env:GITHUB_OUTPUT
+          "checksum_name=$archive.sha256" >> $env:GITHUB_OUTPUT
+          "artifact_name=windows-netgen-sdk-static-$prefix" >> $env:GITHUB_OUTPUT
+
+      - name: Build, package and qualify static SDK
+        shell: pwsh
+        env:
+          QUALIFICATION_RUN_ID: ${{ needs.build.outputs.qualification_run_id }}
+          ARCHIVE_NAME: ${{ steps.names.outputs.archive_name }}
+        run: |
+          & .github/windows-netgen-sdk/build-static.ps1 -OcctRoot "$env:OCCT_STATIC_ROOT" -ArchiveName "$env:ARCHIVE_NAME"
+          if($LASTEXITCODE -ne 0) { throw "Windows static SDK producer failed." }
+
+      - name: Upload qualified static workflow artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: ${{ steps.names.outputs.artifact_name }}
+          path: ${{ runner.temp }}/qualified-static-assets/*
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 30

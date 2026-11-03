@@ -1,0 +1,25 @@
+name: Thin Netgen source validation
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-contract:
+    name: Validate source preparation contract
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out producer repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          fetch-depth: 1
+
+      - name: Run source preparation negative cases
+        run: |
+          python3 scripts/tests/test_prepare_netgen_source.py
+          python3 scripts/tests/test_release_contract.py

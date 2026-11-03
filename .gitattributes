@@ -1,0 +1,16 @@
+# Normalize ordinary text, and make source-provenance inputs deterministic.
+* text=auto
+
+*.md text eol=lf
+*.py text eol=lf
+*.sh text eol=lf
+*.yml text eol=lf
+*.ps1 text eol=lf
+*.txt text eol=lf
+AGENTS.md text eol=lf
+patches/netgen/*.patch text eol=lf -whitespace
+patches/netgen/series text eol=lf
+LICENSE -whitespace
+
+# Keep the native SDK geometry fixtures byte-for-byte stable.
+tests/*-native-sdk/*.brep -text
