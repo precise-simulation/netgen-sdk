@@ -120,6 +120,17 @@ def expected_source_provenance(repo_root: Path) -> dict[str, Any]:
     }
 
 
+def patched_source_archive_name(provenance: dict[str, Any]) -> str:
+    upstream = provenance.get("upstream", {})
+    version = str(upstream.get("version", ""))
+    commit = str(upstream.get("commit", "")).lower()
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+        raise SourceError(f"invalid source provenance version: {version!r}")
+    if not _SHA_RE.fullmatch(commit):
+        raise SourceError(f"invalid source provenance commit: {commit!r}")
+    return f"netgen-{version}-patched-source-{commit[:12]}.tar.gz"
+
+
 def run_git(args: list[str], cwd: Path | None = None) -> str:
     result = subprocess.run(
         ["git", *args],

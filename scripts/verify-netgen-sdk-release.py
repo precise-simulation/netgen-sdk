@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 import tarfile
 import urllib.parse
@@ -16,7 +17,7 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-from netgen_source import SourceError, expected_source_provenance
+from netgen_source import SourceError, expected_source_provenance, patched_source_archive_name
 
 
 OCCT_RE = re.compile(r"^occt-sdk-([0-9]+\.[0-9]+\.[0-9]+)(?:-r[0-9]+)?$")
@@ -70,6 +71,81 @@ def require(condition: bool, message: str) -> None:
         raise ValueError(message)
 
 
+def source_tree_entries(source_root: Path) -> dict[str, tuple[str, int | None, str | None]]:
+    require(source_root.is_dir(), f"source root does not exist: {source_root}")
+    require(not (source_root / "source-provenance.json").exists(), "source root unexpectedly contains source-provenance.json")
+    entries: dict[str, tuple[str, int | None, str | None]] = {}
+    for path in sorted(source_root.rglob("*"), key=lambda item: item.relative_to(source_root).as_posix()):
+        relative = path.relative_to(source_root)
+        if relative.parts and relative.parts[0] == ".git":
+            continue
+        name = relative.as_posix()
+        if path.is_symlink():
+            entries[name] = ("symlink", None, os.readlink(path))
+        elif path.is_dir():
+            entries[name] = ("dir", None, None)
+        elif path.is_file():
+            entries[name] = ("file", stat.S_IMODE(path.stat().st_mode), sha256(path))
+        else:
+            raise ValueError(f"unsupported source entry type: {path}")
+    return entries
+
+
+def verify_source_archive(source_assets_root: Path, source_root: Path, expected: dict[str, Any]) -> str:
+    archive_name = patched_source_archive_name(expected)
+    archive_path = source_assets_root / archive_name
+    checksum_path = source_assets_root / f"{archive_name}.sha256"
+    require(archive_path.is_file(), f"missing source archive: {archive_path}")
+    require(checksum_path.is_file(), f"missing source checksum: {checksum_path}")
+    checksum_parts = checksum_path.read_text(encoding="utf-8").split()
+    require(len(checksum_parts) == 2 and checksum_parts[1] == archive_name, "source checksum sidecar format mismatch")
+    require(checksum_parts[0].lower() == sha256(archive_path), "source archive checksum mismatch")
+
+    root_name = archive_name.removesuffix(".tar.gz")
+    expected_entries = source_tree_entries(source_root)
+    expected_provenance = (json.dumps(expected, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    actual_entries: dict[str, tuple[str, int | None, str | None]] = {}
+    seen_relative: set[str] = set()
+    provenance_seen = False
+
+    with tarfile.open(archive_path, "r:gz") as archive:
+        members = archive.getmembers()
+        root_members = [member for member in members if member.name == root_name]
+        require(len(root_members) == 1 and root_members[0].isdir(), "source archive root directory mismatch")
+        for member in members:
+            if member.name == root_name:
+                continue
+            prefix = f"{root_name}/"
+            require(member.name.startswith(prefix), f"source archive member outside root: {member.name}")
+            relative = member.name[len(prefix):]
+            require(relative and not relative.startswith("/") and ".." not in Path(relative).parts, f"unsafe source archive member: {member.name}")
+            require(relative not in seen_relative, f"duplicate source archive member: {relative}")
+            seen_relative.add(relative)
+
+            if relative == "source-provenance.json":
+                require(member.isfile(), "source-provenance.json is not a regular file")
+                stream = archive.extractfile(member)
+                require(stream is not None and stream.read() == expected_provenance, "source provenance mismatch")
+                provenance_seen = True
+                continue
+
+            if member.isfile():
+                stream = archive.extractfile(member)
+                require(stream is not None, f"cannot read source archive member: {relative}")
+                digest = hashlib.sha256(stream.read()).hexdigest()
+                actual_entries[relative] = ("file", member.mode & 0o7777, digest)
+            elif member.isdir():
+                actual_entries[relative.rstrip("/")] = ("dir", None, None)
+            elif member.issym():
+                actual_entries[relative] = ("symlink", None, member.linkname)
+            else:
+                raise ValueError(f"unsupported source archive member type: {relative}")
+
+    require(provenance_seen, "source archive is missing source-provenance.json")
+    require(actual_entries == expected_entries, "source archive tree differs from reconstructed patched source")
+    return archive_name
+
+
 def verify_occt_asset(info: dict[str, Any], release: dict[str, Any]) -> None:
     occt = info["occt"]
     asset_id = int(occt["asset_id"])
@@ -99,6 +175,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--assets-root", type=Path, required=True)
+    parser.add_argument("--source-assets-root", type=Path, required=True)
+    parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--producer-sha", required=True)
     parser.add_argument("--producer-repository", required=True)
     parser.add_argument("--occt-release", required=True)
@@ -120,6 +198,13 @@ def main() -> int:
 
         files = sorted(path for path in args.assets_root.rglob("*") if path.is_file())
         require(len(files) == 16, f"expected 16 release files, found {len(files)}")
+        source_files = sorted(path for path in args.source_assets_root.rglob("*") if path.is_file())
+        require(len(source_files) == 2, f"expected 2 source release files, found {len(source_files)}")
+        source_archive = verify_source_archive(
+            args.source_assets_root.resolve(),
+            args.source_root.resolve(),
+            expected,
+        )
 
         expected_upstream = expected["upstream"]
         expected_patches = expected["patches"]
@@ -164,6 +249,7 @@ def main() -> int:
                     "netgen_version": expected_upstream["version"],
                     "upstream_commit": expected_upstream["commit"],
                     "occt_source_sha": occt_source_sha,
+                    "source_archive": source_archive,
                 },
                 sort_keys=True,
             )

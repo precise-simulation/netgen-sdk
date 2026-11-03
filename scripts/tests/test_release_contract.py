@@ -23,6 +23,7 @@ from netgen_source import expected_source_provenance  # noqa: E402
 
 VERIFY = SCRIPTS / "verify-netgen-sdk-release.py"
 QUALIFY = SCRIPTS / "check-release-qualification.py"
+PACKAGE = SCRIPTS / "package-netgen-source.py"
 PRODUCER_SHA = "a" * 40
 PRODUCER_REPOSITORY = "precise-simulation/netgen-sdk"
 OCCT_SOURCE_SHA = "b" * 40
@@ -34,12 +35,15 @@ class ReleaseVerifierTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.assets = self.root / "assets"
+        self.source_assets = self.root / "source-assets"
+        self.source_root = self.root / "source-root"
         self.provenance = expected_source_provenance(REPO_ROOT)
         self.occt_release = (REPO_ROOT / ".github" / "occt-sdk-release.txt").read_text(encoding="utf-8").strip()
         self.occt_version = self.occt_release.removeprefix("occt-sdk-").split("-r", 1)[0]
         self.release_assets: list[dict[str, object]] = []
         self.infos: dict[str, dict[str, object]] = {}
         self.build_archives()
+        self.build_source_archive()
         self.release_json = self.root / "occt-release.json"
         self.write_release_json()
 
@@ -119,6 +123,38 @@ class ReleaseVerifierTests(unittest.TestCase):
             self.infos[name] = info
             self.write_archive(name, directory, info)
 
+    def build_source_archive(self) -> None:
+        self.source_root.mkdir(parents=True, exist_ok=True)
+        (self.source_root / "tracked.txt").write_bytes(b"patched source\n")
+        (self.source_root / "cmake").mkdir()
+        (self.source_root / "cmake" / "config.cmake").write_bytes(b"set(TEST 1)\n")
+        (self.source_root / ".git" / "objects").mkdir(parents=True)
+        (self.source_root / ".git" / "objects" / "ignored").write_bytes(b"ignored\n")
+        provenance_path = self.root / "source-provenance.json"
+        provenance_path.write_text(
+            json.dumps(self.provenance, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(PACKAGE),
+                "--source-root",
+                str(self.source_root),
+                "--provenance",
+                str(provenance_path),
+                "--output-dir",
+                str(self.source_assets),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if result.returncode:
+            raise RuntimeError(result.stdout + result.stderr)
+
     def write_release_json(self) -> None:
         self.release_json.write_text(
             json.dumps(
@@ -139,6 +175,10 @@ class ReleaseVerifierTests(unittest.TestCase):
                 str(VERIFY),
                 "--assets-root",
                 str(self.assets),
+                "--source-assets-root",
+                str(self.source_assets),
+                "--source-root",
+                str(self.source_root),
                 "--producer-sha",
                 PRODUCER_SHA,
                 "--producer-repository",
@@ -181,6 +221,20 @@ class ReleaseVerifierTests(unittest.TestCase):
                 name, directory, _, _ = self.specs()[0]
                 self.write_archive(name, directory, self.infos[name])
 
+    def test_rejects_source_tree_mismatch(self) -> None:
+        (self.source_root / "tracked.txt").write_bytes(b"tampered after packaging\n")
+        result = self.run_verify()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("source archive tree differs", result.stderr)
+
+    def test_rejects_source_checksum_tampering(self) -> None:
+        sidecar = next(self.source_assets.glob("*.sha256"))
+        parts = sidecar.read_text(encoding="utf-8").split()
+        sidecar.write_text(f"{'0' * 64}  {parts[1]}\n", encoding="utf-8")
+        result = self.run_verify()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("source archive checksum mismatch", result.stderr)
+
 
 class ReleaseWorkflowContractTests(unittest.TestCase):
     def test_publication_requires_and_verifies_immutable_release(self) -> None:
@@ -188,6 +242,14 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn('"repos/$GITHUB_REPOSITORY/immutable-releases"', workflow)
         self.assertIn('run_marker="netgen-sdk-release-run:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}"', workflow)
         self.assertIn("published release is not immutable", workflow)
+
+    def test_release_includes_reconstructed_source_pair(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("scripts/package-netgen-source.py", workflow)
+        self.assertIn('--source-assets-root "$RUNNER_TEMP/source-assets"', workflow)
+        self.assertIn('test "${#source_assets[@]}" -eq 2', workflow)
+        self.assertIn('test "${#assets[@]}" -eq 18', workflow)
+        self.assertIn("test \"$(jq '.assets | length' <<<\"$release_json\")\" -eq 18", workflow)
 
     def test_failure_cleanup_classifies_remote_release_state(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
