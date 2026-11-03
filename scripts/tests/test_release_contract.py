@@ -237,9 +237,9 @@ class ReleaseVerifierTests(unittest.TestCase):
 
 
 class ReleaseWorkflowContractTests(unittest.TestCase):
-    def test_publication_requires_and_verifies_immutable_release(self) -> None:
+    def test_publication_verifies_immutable_release_after_publish(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
-        self.assertIn('"repos/$GITHUB_REPOSITORY/immutable-releases"', workflow)
+        self.assertNotIn('"repos/$GITHUB_REPOSITORY/immutable-releases"', workflow)
         self.assertIn('run_marker="netgen-sdk-release-run:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}"', workflow)
         self.assertIn("published release is not immutable", workflow)
 
