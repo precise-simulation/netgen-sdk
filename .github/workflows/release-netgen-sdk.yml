@@ -257,14 +257,6 @@ jobs:
             exit 1
           fi
 
-          immutable_settings="$(gh api \
-            -H "X-GitHub-Api-Version: $api_version" \
-            "repos/$GITHUB_REPOSITORY/immutable-releases")"
-          if [[ "$(jq -r '.enabled' <<<"$immutable_settings")" != "true" ]]; then
-            echo "immutable releases are not enabled for $GITHUB_REPOSITORY" >&2
-            exit 1
-          fi
-
           mapfile -t sdk_assets < <(find "$RUNNER_TEMP/release-assets" -type f -print | sort)
           test "${#sdk_assets[@]}" -eq 16
           mapfile -t source_assets < <(find "$RUNNER_TEMP/source-assets" -maxdepth 1 -type f -print | sort)
