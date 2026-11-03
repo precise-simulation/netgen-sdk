@@ -140,6 +140,12 @@ downloaded archive set has passed the combined verifier. A failed or superseded
 attempt for the same producer revision uses the next `rN`; do not move an
 existing release tag.
 
+Repository immutable releases must be enabled before publication. The release
+workflow creates a marked draft, verifies the complete asset inventory and digests,
+publishes it, and then requires GitHub to report `immutable: true`. If publication
+remains mutable, the workflow removes only the release record it created and keeps
+the qualified tag for safe retry.
+
 ## Automatic OCCT SDK updates
 
 `workflows/auto-occt-netgen-release.yml` and

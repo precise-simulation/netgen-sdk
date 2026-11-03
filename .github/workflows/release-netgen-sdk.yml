@@ -126,6 +126,8 @@ jobs:
           set -euo pipefail
           api_version="2026-03-10"
           draft_id=""
+          create_attempted=0
+          run_marker="netgen-sdk-release-run:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}"
 
           find_draft_id() {
             gh api --paginate \
@@ -139,6 +141,76 @@ jobs:
                 end
               '
           }
+
+          find_our_draft_id() {
+            gh api --paginate \
+              -H "X-GitHub-Api-Version: $api_version" \
+              "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+              jq -rs --arg tag "$GITHUB_REF_NAME" --arg marker "$run_marker" '
+                [ .[][] |
+                  select(.tag_name == $tag and .draft == true) |
+                  select((.body // "") | contains($marker))
+                ] |
+                if length == 1 then .[0].id
+                elif length == 0 then empty
+                else error("multiple workflow-owned draft releases found for tag")
+                end
+              '
+          }
+
+          cleanup_failed_publication() {
+            status=$?
+            trap - EXIT
+            if [[ "$status" -eq 0 ]]; then
+              exit 0
+            fi
+
+            if [[ "$create_attempted" -eq 1 && -z "$draft_id" ]]; then
+              draft_id="$(find_our_draft_id 2>/dev/null || true)"
+            fi
+            if [[ -z "$draft_id" ]]; then
+              exit "$status"
+            fi
+
+            release_json="$(gh api \
+              -H "X-GitHub-Api-Version: $api_version" \
+              "repos/$GITHUB_REPOSITORY/releases/$draft_id" 2>/dev/null || true)"
+            if [[ -z "$release_json" ]]; then
+              exit "$status"
+            fi
+
+            if jq -e \
+              --arg tag "$GITHUB_REF_NAME" \
+              --arg marker "$run_marker" \
+              '.draft == true and .tag_name == $tag and ((.body // "") | contains($marker))' \
+              <<<"$release_json" >/dev/null; then
+              gh api -X DELETE \
+                -H "X-GitHub-Api-Version: $api_version" \
+                "repos/$GITHUB_REPOSITORY/releases/$draft_id" || true
+            elif jq -e \
+              --arg tag "$GITHUB_REF_NAME" \
+              --arg marker "$run_marker" \
+              '.draft == false and .prerelease == false and .immutable == false and .tag_name == $tag and ((.body // "") | contains($marker))' \
+              <<<"$release_json" >/dev/null; then
+              if gh api -X DELETE \
+                -H "X-GitHub-Api-Version: $api_version" \
+                "repos/$GITHUB_REPOSITORY/releases/$draft_id"; then
+                echo "removed workflow-owned published release after GitHub reported it mutable; retained tag for safe retry" >&2
+              else
+                echo "failed to remove workflow-owned mutable published release $draft_id; manual remediation is required" >&2
+              fi
+            elif jq -e \
+              --arg tag "$GITHUB_REF_NAME" \
+              --arg marker "$run_marker" \
+              '.draft == false and .prerelease == false and .immutable == true and .tag_name == $tag and ((.body // "") | contains($marker))' \
+              <<<"$release_json" >/dev/null; then
+              echo "workflow-owned release $draft_id is already immutable; preserving it and the tag" >&2
+            else
+              echo "release $draft_id is not a verified workflow-owned draft or publication; preserving it and the tag" >&2
+            fi
+            exit "$status"
+          }
+          trap cleanup_failed_publication EXIT
 
           verify_remote_tag() {
             local ref_json object_type object_sha tag_json
@@ -170,6 +242,14 @@ jobs:
             exit 1
           fi
 
+          immutable_settings="$(gh api \
+            -H "X-GitHub-Api-Version: $api_version" \
+            "repos/$GITHUB_REPOSITORY/immutable-releases")"
+          if [[ "$(jq -r '.enabled' <<<"$immutable_settings")" != "true" ]]; then
+            echo "immutable releases are not enabled for $GITHUB_REPOSITORY" >&2
+            exit 1
+          fi
+
           mapfile -t assets < <(find "$RUNNER_TEMP/release-assets" -type f -print | sort)
           test "${#assets[@]}" -eq 16
           notes="Netgen native SDK bundle built from producer source $GITHUB_SHA (upstream $NETGEN_TAG / $NETGEN_UPSTREAM_SHA)."
@@ -178,8 +258,10 @@ jobs:
           notes="$notes"$'\n'"Linux: x86_64 shared and static SDKs, manylinux2014 / glibc 2.17 / GCC 10 baseline."
           notes="$notes"$'\n'"macOS: thin x86_64 and arm64 shared and static SDKs targeting macOS 13.0 with Xcode 16.4."
           notes="$notes"$'\n\n'"Each archive has a SHA-256 sidecar and was re-extracted and qualified through the native OCC consumer."
+          notes="$notes"$'\n\n'"<!-- $run_marker -->"
 
           verify_remote_tag
+          create_attempted=1
           gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
@@ -187,10 +269,11 @@ jobs:
             --title "Netgen v$NETGEN_VERSION SDKs - Windows, Linux, macOS" \
             --notes "$notes"
 
-          draft_id="$(find_draft_id)"
+          draft_id="$(find_our_draft_id)"
           test -n "$draft_id"
           release_json="$(gh api -H "X-GitHub-Api-Version: $api_version" "repos/$GITHUB_REPOSITORY/releases/$draft_id")"
           test "$(jq -r '.draft' <<<"$release_json")" = true
+          test "$(jq -r '.prerelease' <<<"$release_json")" = false
           test "$(jq -r '.tag_name' <<<"$release_json")" = "$GITHUB_REF_NAME"
           test "$(jq '.assets | length' <<<"$release_json")" -eq 16
           for file in "${assets[@]}"; do
@@ -208,6 +291,11 @@ jobs:
 
           release_json="$(gh api -H "X-GitHub-Api-Version: $api_version" "repos/$GITHUB_REPOSITORY/releases/$draft_id")"
           test "$(jq -r '.draft' <<<"$release_json")" = false
+          test "$(jq -r '.prerelease' <<<"$release_json")" = false
+          if [[ "$(jq -r '.immutable' <<<"$release_json")" != "true" ]]; then
+            echo "published release is not immutable; removing the workflow-owned mutable release" >&2
+            exit 1
+          fi
           test "$(jq -r '.tag_name' <<<"$release_json")" = "$GITHUB_REF_NAME"
           test "$(jq '.assets | length' <<<"$release_json")" -eq 16
           for file in "${assets[@]}"; do

@@ -26,6 +26,7 @@ QUALIFY = SCRIPTS / "check-release-qualification.py"
 PRODUCER_SHA = "a" * 40
 PRODUCER_REPOSITORY = "precise-simulation/netgen-sdk"
 OCCT_SOURCE_SHA = "b" * 40
+RELEASE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "release-netgen-sdk.yml"
 
 
 class ReleaseVerifierTests(unittest.TestCase):
@@ -179,6 +180,28 @@ class ReleaseVerifierTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                 name, directory, _, _ = self.specs()[0]
                 self.write_archive(name, directory, self.infos[name])
+
+
+class ReleaseWorkflowContractTests(unittest.TestCase):
+    def test_publication_requires_and_verifies_immutable_release(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn('"repos/$GITHUB_REPOSITORY/immutable-releases"', workflow)
+        self.assertIn('run_marker="netgen-sdk-release-run:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}"', workflow)
+        self.assertIn("published release is not immutable", workflow)
+
+    def test_failure_cleanup_classifies_remote_release_state(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        start = workflow.index("          cleanup_failed_publication() {")
+        end = workflow.index("          trap cleanup_failed_publication EXIT", start)
+        cleanup = workflow[start:end]
+
+        self.assertIn("release_json=\"$(gh api", cleanup)
+        self.assertIn(".draft == true", cleanup)
+        self.assertIn(".immutable == false", cleanup)
+        self.assertIn(".immutable == true", cleanup)
+        self.assertGreaterEqual(cleanup.count("contains($marker)"), 3)
+        self.assertNotIn('if [[ "$published"', cleanup)
+        self.assertNotIn("immutability_verified", cleanup)
 
 
 class QualificationTests(unittest.TestCase):
