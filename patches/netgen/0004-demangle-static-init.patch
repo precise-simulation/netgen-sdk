@@ -1,0 +1,59 @@
+diff --git a/libsrc/core/utils.cpp b/libsrc/core/utils.cpp
+index 4ab08f3..98179b5 100644
+--- a/libsrc/core/utils.cpp
++++ b/libsrc/core/utils.cpp
+@@ -26,30 +26,32 @@ namespace ngcore
+ {
+     namespace detail
+     {
+-        // see https://github.com/RobotLocomotion/drake/blob/master/common/nice_type_name.cc
+-        static const auto demangle_regexes =
+-            std::array<std::pair<std::regex, std::string>, 8>{
+-                // Remove unwanted keywords and following space. (\b is word boundary.)
+-                std::make_pair(std::regex("\\b(class|struct|enum|union) "), ""),
+-                // Tidy up anonymous namespace.
+-                {std::regex("[`(]anonymous namespace[')]"), "(anonymous)"},
+-                // Replace Microsoft __int64 with long long.
+-                {std::regex("\\b__int64\\b"), "long long"},
+-                // Temporarily replace spaces we want to keep with "!". (\w is
+-                // alphanumeric or underscore.)
+-                {std::regex("(\\w) (\\w)"), "$1!$2"},
+-                {std::regex(" "), ""},  // Delete unwanted spaces.
+-                // Some compilers throw in extra namespaces like "__1" or "__cxx11".
+-                // Delete them.
+-                {std::regex("\\b__[[:alnum:]_]+::"), ""},
+-                {std::regex("!"), " "},  // Restore wanted spaces.
+-
+-                // Recognize std::string's full name and abbreviate.
+-                {std::regex("\\bstd::basic_string<char,std::char_traits<char>,"
+-                        "std::allocator<char>>"), "std::string"}
+-            };
+         std::string CleanupDemangledName( std::string s )
+         {
++            // Archive registrars call Demangle during static initialization, so
++            // construct the regexes on first use to avoid cross-TU ordering.
++            // see https://github.com/RobotLocomotion/drake/blob/master/common/nice_type_name.cc
++            static const auto demangle_regexes =
++                std::array<std::pair<std::regex, std::string>, 8>{
++                    // Remove unwanted keywords and following space. (\b is word boundary.)
++                    std::make_pair(std::regex("\\b(class|struct|enum|union) "), ""),
++                    // Tidy up anonymous namespace.
++                    {std::regex("[`(]anonymous namespace[')]"), "(anonymous)"},
++                    // Replace Microsoft __int64 with long long.
++                    {std::regex("\\b__int64\\b"), "long long"},
++                    // Temporarily replace spaces we want to keep with "!". (\w is
++                    // alphanumeric or underscore.)
++                    {std::regex("(\\w) (\\w)"), "$1!$2"},
++                    {std::regex(" "), ""},  // Delete unwanted spaces.
++                    // Some compilers throw in extra namespaces like "__1" or "__cxx11".
++                    // Delete them.
++                    {std::regex("\\b__[[:alnum:]_]+::"), ""},
++                    {std::regex("!"), " "},  // Restore wanted spaces.
++
++                    // Recognize std::string's full name and abbreviate.
++                    {std::regex("\\bstd::basic_string<char,std::char_traits<char>,"
++                            "std::allocator<char>>"), "std::string"}
++                };
+             for(const auto & [r, sub] : demangle_regexes)
+                 s = std::regex_replace (s,r,sub);
+ #ifdef EMSCRIPTEN
