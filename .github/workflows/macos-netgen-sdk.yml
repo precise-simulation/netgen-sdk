@@ -166,4 +166,4 @@ jobs:
           name: ${{ matrix.linkage == 'shared' && format('netgen-macos-sdk-{0}-{1}', matrix.architecture, github.sha) || format('netgen-macos-sdk-{0}-static-{1}', matrix.architecture, github.sha) }}
           path: ${{ runner.temp }}/netgen-macos-sdk-out/${{ matrix.architecture }}/${{ matrix.linkage }}/*
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 3
