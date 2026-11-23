@@ -208,7 +208,7 @@ jobs:
           name: ${{ matrix.linkage == 'shared' && needs.metadata.outputs.shared_artifact_name || needs.metadata.outputs.static_artifact_name }}
           path: ${{ runner.temp }}/netgen-linux-sdk/out/*
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 3
 
   compatibility:
     name: Ubuntu ${{ matrix.ubuntu }} / ${{ matrix.linkage }} consumer
