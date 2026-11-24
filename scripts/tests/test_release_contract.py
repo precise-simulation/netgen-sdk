@@ -265,6 +265,23 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertNotIn('if [[ "$published"', cleanup)
         self.assertNotIn("immutability_verified", cleanup)
 
+    def test_published_release_cleanup_deletes_only_current_run_sdk_artifacts(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        start = workflow.index("  cleanup-transit-artifacts:")
+        end = workflow.index("  notify-geomtool-mock:", start)
+        cleanup = workflow[start:end]
+
+        self.assertIn("    if: startsWith(github.ref, 'refs/tags/netgen-sdk-')", cleanup)
+        self.assertIn("    needs: publish", cleanup)
+        self.assertIn("      actions: write", cleanup)
+        self.assertNotIn("contents:", cleanup)
+        self.assertIn("        continue-on-error: true", cleanup)
+        self.assertIn('actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100', cleanup)
+        self.assertIn('startswith(\"windows-netgen-sdk-\")', cleanup)
+        self.assertIn('startswith(\"netgen-linux-sdk-\")', cleanup)
+        self.assertIn('startswith(\"netgen-macos-sdk-\")', cleanup)
+        self.assertIn('actions/artifacts/$artifact_id', cleanup)
+
 
 class QualificationTests(unittest.TestCase):
     def setUp(self) -> None:
