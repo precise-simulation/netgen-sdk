@@ -157,6 +157,16 @@ publishes it, and then requires GitHub to report `immutable: true`. If publicati
 remains mutable, the workflow removes only the release record it created and keeps
 the qualified tag for safe retry.
 
+After an immutable Netgen SDK release is published, the release workflow sends
+the exact tag in a `netgen_sdk_released` repository-dispatch event to
+`precise-simulation/geomtool-mock`. This starts its SDK compatibility canary
+without polling or pull-request triggers. Configure the `netgen-sdk` Actions
+secret `GEOMTOOL_MOCK_DISPATCH_TOKEN` with a fine-grained GitHub token scoped
+to the `geomtool-mock` repository and `Contents: read and write` permission;
+the producer's default `GITHUB_TOKEN` cannot dispatch to another repository.
+The notification job fails if the secret is missing or the dispatch fails,
+while a previously published immutable SDK release remains published.
+
 ## Automatic OCCT SDK updates
 
 `workflows/auto-occt-netgen-release.yml` and
