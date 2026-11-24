@@ -160,12 +160,15 @@ the qualified tag for safe retry.
 After an immutable Netgen SDK release is published, the release workflow sends
 the exact tag in a `netgen_sdk_released` repository-dispatch event to
 `precise-simulation/geomtool-mock`. This starts its SDK compatibility canary
-without polling or pull-request triggers. Configure the `netgen-sdk` Actions
-secret `GEOMTOOL_MOCK_DISPATCH_TOKEN` with a fine-grained GitHub token scoped
-to the `geomtool-mock` repository and `Contents: read and write` permission;
-the producer's default `GITHUB_TOKEN` cannot dispatch to another repository.
-The notification job fails if the secret is missing or the dispatch fails,
-while a previously published immutable SDK release remains published.
+without polling or pull-request triggers. The notification job reports a failure
+if the event cannot be submitted, while an already published immutable SDK
+release remains published.
+The dispatch API confirms event submission, not downstream build success: check
+the **Netgen SDK compatibility canary** workflow in `geomtool-mock` for its
+qualification result and `canary-netgen-sdk-*` success marker. If notification
+fails after publication, manually run that canary in `geomtool-mock` on `main`,
+specifying the exact published `netgen_release` tag; do not create another SDK
+release just to retry qualification.
 
 ## Automatic OCCT SDK updates
 

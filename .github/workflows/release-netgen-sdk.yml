@@ -335,7 +335,7 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -z "$GH_TOKEN" ]]; then
-            echo "GEOMTOOL_MOCK_DISPATCH_TOKEN must be configured to trigger the downstream canary" >&2
+            echo "Downstream canary dispatch authentication is unavailable" >&2
             exit 1
           fi
 
